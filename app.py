@@ -165,7 +165,7 @@ function showPreview(d){
 urlIn.addEventListener("input", ()=>{
   clearTimeout(debounceTimer);
   const url = urlIn.value.trim();
-  if(!/^https?:\\/\\//i.test(url)){ hidePreview(); return; }
+  if(!/^https?:\\\\/\\\\//i.test(url)){ hidePreview(); return; }
   debounceTimer = setTimeout(()=>fetchInfo(url), 500);
 });
 
@@ -186,7 +186,7 @@ frm.addEventListener("submit", async (e)=>{
   const fmt = formatSel.value;
   const name = document.getElementById("name").value.trim();
 
-  if(!/^https?:\\/\\//i.test(url)){
+  if(!/^https?:\\\\/\\\\//i.test(url)){
     setMsg("Please paste a valid URL.", true); setBusy(false); return;
   }
 
