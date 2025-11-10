@@ -12,6 +12,7 @@ if cookies_data:
     with open("cookies.txt", "w", encoding="utf-8") as f:
         f.write(cookies_data)
 
+
 # ---------- FFmpeg Detection ----------
 def ffmpeg_path():
     return which("ffmpeg") or "/usr/bin/ffmpeg" or "/data/data/com.termux/files/usr/bin/ffmpeg"
@@ -333,6 +334,10 @@ def fetch(id):
     threading.Thread(target=lambda: (shutil.rmtree(j.tmp, ignore_errors=True), JOBS.pop(id,None)), daemon=True).start()
     return resp
 
+@app.get("/env")
+def env():
+    return jsonify({"ffmpeg": HAS_FFMPEG})
+    
 @app.get("/")
 def home():
     return render_template_string(HTML)
