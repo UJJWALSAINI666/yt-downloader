@@ -1,33 +1,33 @@
-import os, re, glob, uuid, shutil, tempfile, threading
-from shutil import which
+import os
 from flask import Flask, request, jsonify, send_file, render_template_string, abort
+import tempfile, shutil, glob, threading, uuid, re, time
+from shutil import which
 from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
-# ---------- Cookies from ENV ----------
+# ---------- Cookies from ENV (Railway variable: COOKIES_TEXT) ----------
 cookies_data = os.environ.get("COOKIES_TEXT", "").strip()
-COOKIE_FILE = "cookies.txt"
 if cookies_data:
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+    with open("cookies.txt", "w", encoding="utf-8") as f:
         f.write(cookies_data)
 
 # ---------- FFmpeg Detection ----------
-def _detect_ffmpeg():
-    cand = which("ffmpeg")
-    if cand and os.path.exists(cand):
-        return cand
-    for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"):
-        if os.path.exists(p):
-            return p
+def ffmpeg_path():
+    # Prefer system ffmpeg if present
+    p = which("ffmpeg")
+    if p and os.path.exists(p):
+        return p
+    # common linux path
+    if os.path.exists("/usr/bin/ffmpeg"):
+        return "/usr/bin/ffmpeg"
     return None
 
-FFMPEG_PATH = _detect_ffmpeg()
-HAS_FFMPEG = FFMPEG_PATH is not None
+FFMPEG_BIN = ffmpeg_path()
+HAS_FFMPEG = bool(FFMPEG_BIN)
 
-# ---------- HTML ----------
-# Raw string so backslashes in JS regex stay intact
-HTML = r"""
+# ---------- HTML UI (UNCHANGED) ----------
+HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -108,7 +108,7 @@ HTML = r"""
             <select id="format">
               <option value="mp4_720" data-need-ffmpeg="1">720p MP4</option>
               <option value="mp4_1080" data-need-ffmpeg="1">1080p MP4</option>
-              <option value="mp4_best">Best MP4 (single file)</option>
+              <option value="mp4_best">4K MP4</option>
               <option value="audio_mp3" data-need-ffmpeg="1">Audio MP3 Only</option>
             </select>
           </div>
@@ -130,7 +130,7 @@ HTML = r"""
         </div>
 
         <p id="msg" role="status" aria-live="polite"></p>
-        <p class="tip">Tip: For 720p/1080p/MP3 merging we need FFmpeg on the server.</p>
+        <p class="tip">Tip: Railway auto-installs FFmpeg via Nixpacks env. For highest quality merges, keep FFmpeg enabled.</p>
       </form>
     </section>
   </main>
@@ -155,7 +155,7 @@ fetch("/env").then(r=>r.json()).then(j=>{
     [...formatSel.options].forEach(o=>{
       if(o.dataset.needFfmpeg==="1"){ o.disabled = true; }
     });
-    setMsg("FFmpeg not found: only single-file MP4 will be available.");
+    setMsg("FFmpeg not found: using single-file MP4 where possible.", false);
   }
 }).catch(()=>{});
 
@@ -173,7 +173,7 @@ function showPreview(d){
 urlIn.addEventListener("input", ()=>{
   clearTimeout(debounceTimer);
   const url = urlIn.value.trim();
-  if(!/^https?:\/\/\S+/i.test(url)){ hidePreview(); return; }
+  if(!/^https?:\/\//i.test(url)){ hidePreview(); return; }
   debounceTimer = setTimeout(()=>fetchInfo(url), 500);
 });
 
@@ -189,11 +189,12 @@ async function fetchInfo(url){
 frm.addEventListener("submit", async (e)=>{
   e.preventDefault();
   setMsg(""); setBusy(true); bar.style.width="0%"; document.querySelector(".progress").setAttribute("aria-valuenow","0");
+
   const url = urlIn.value.trim();
   const fmt = formatSel.value;
   const name = document.getElementById("name").value.trim();
 
-  if(!/^https?:\/\/\S+/i.test(url)){
+  if(!/^https?:\/\//i.test(url)){
     setMsg("Please paste a valid URL.", true); setBusy(false); return;
   }
 
@@ -230,6 +231,7 @@ async function poll(){
 
 # ---------- Jobs ----------
 JOBS = {}
+JOB_TTL_SECONDS = 15 * 60  # auto-expire safety
 
 class Job:
     def __init__(self):
@@ -239,7 +241,18 @@ class Job:
         self.status = "queued"
         self.file = None
         self.error = None
+        self.created = time.time()
         JOBS[self.id] = self
+
+def cleanup_expired_jobs():
+    now = time.time()
+    to_del = []
+    for jid, j in list(JOBS.items()):
+        if (now - getattr(j, "created", now)) > JOB_TTL_SECONDS and j.status != "finished":
+            shutil.rmtree(j.tmp, ignore_errors=True)
+            to_del.append(jid)
+    for jid in to_del:
+        JOBS.pop(jid, None)
 
 # ---------- Helpers ----------
 YTDLP_URL_RE = re.compile(r"^https?://", re.I)
@@ -253,11 +266,10 @@ def format_map_for_env():
             "audio_mp3": "bestaudio/best"
         }
     else:
-        # try to fetch progressive/mp4 single file with audio
         return {
-            "mp4_720"  : None,   # blocked without ffmpeg
-            "mp4_1080" : None,   # blocked without ffmpeg
-            "mp4_best" : "best[ext=mp4][acodec!=none]/best[acodec!=none]",
+            "mp4_720"  : "best[ext=mp4][height<=720]/best[ext=mp4]",
+            "mp4_1080" : "best[ext=mp4][height<=1080]/best[ext=mp4]",
+            "mp4_best" : "best[ext=mp4]/best",
             "audio_mp3": None
         }
 
@@ -268,14 +280,17 @@ def run_download(job, url, fmt_key, filename):
 
         fmt = format_map_for_env().get(fmt_key)
         if fmt is None:
-            job.status="error"; job.error="This format requires FFmpeg on server."; return
+            job.status="error"; job.error="This format requires FFmpeg."; return
 
         def hook(d):
-            if d.get("status")=="downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-                job.percent = int((d.get("downloaded_bytes",0) * 100) / total)
-            elif d.get("status")=="finished":
-                job.percent = 100
+            try:
+                if d.get("status")=="downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+                    job.percent = int((d.get("downloaded_bytes",0) * 100) / total)
+                elif d.get("status")=="finished":
+                    job.percent = 100
+            except Exception:
+                pass
 
         base = (filename.strip() if filename else "%(title)s").rstrip(".")
         out = os.path.join(job.tmp, base + ".%(ext)s")
@@ -284,37 +299,40 @@ def run_download(job, url, fmt_key, filename):
             "format": fmt,
             "outtmpl": out,
             "merge_output_format": "mp4",
+            "cookiefile": "cookies.txt",
             "progress_hooks": [hook],
             "quiet": True,
             "no_warnings": True,
-            "noplaylist": True,
-            "concurrent_fragment_downloads": 4,
+            "noplaylist": True
         }
 
-        if cookies_data and os.path.exists(COOKIE_FILE):
-            opts["cookiefile"] = COOKIE_FILE
-
-        if HAS_FFMPEG and FFMPEG_PATH:
-            opts["ffmpeg_location"] = FFMPEG_PATH
+        if HAS_FFMPEG and FFMPEG_BIN:
+            opts["ffmpeg_location"] = FFMPEG_BIN
             if fmt_key == "audio_mp3":
                 opts["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3"}]
 
         with YoutubeDL(opts) as y:
             y.extract_info(url, download=True)
 
-        files = glob.glob(os.path.join(job.tmp, "*"))
+        files = glob.glob(job.tmp + "/*")
         if not files:
-            job.status="error"; job.error="No file produced."; return
+            job.status="error"; job.error="No output file"; return
         job.file = max(files, key=os.path.getsize)
         job.status = "finished"
 
     except Exception as e:
-        job.status="error"; job.error=str(e)[:250]
+        job.status="error"; job.error=str(e)[:200]
 
 # ---------- Routes ----------
+@app.get("/env")
+def env_info():
+    # Used by frontend to enable/disable options
+    return jsonify({"ffmpeg": HAS_FFMPEG})
+
 @app.post("/start")
 def start():
-    d = request.json or {}
+    cleanup_expired_jobs()
+    d = request.get_json(force=True) or {}
     job = Job()
     threading.Thread(
         target=run_download,
@@ -325,13 +343,10 @@ def start():
 
 @app.post("/info")
 def info():
-    d = request.json or {}
+    d = request.get_json(force=True) or {}
     url = d.get("url","")
     try:
-        with YoutubeDL({
-            "skip_download": True, "quiet": True, "noplaylist": True,
-            **({"cookiefile": COOKIE_FILE} if os.path.exists(COOKIE_FILE) else {})
-        }) as y:
+        with YoutubeDL({"skip_download":True,"quiet":True,"noplaylist":True,"cookiefile":"cookies.txt"}) as y:
             info = y.extract_info(url, download=False)
         title = info.get("title","")
         channel = info.get("uploader") or info.get("channel","")
@@ -339,7 +354,7 @@ def info():
         dur = info.get("duration") or 0
         return jsonify({"title":title,"thumbnail":thumb,"channel":channel,"duration_str":f"{dur//60}:{dur%60:02d}"})
     except Exception:
-        return jsonify({"error":"Preview failed"}), 400
+        return jsonify({"error":"Preview failed"}),400
 
 @app.get("/progress/<id>")
 def progress(id):
@@ -355,13 +370,15 @@ def fetch(id):
     threading.Thread(target=lambda: (shutil.rmtree(j.tmp, ignore_errors=True), JOBS.pop(id,None)), daemon=True).start()
     return resp
 
-@app.get("/env")
-def env():
-    return jsonify({"ffmpeg": bool(HAS_FFMPEG), "ffmpeg_path": FFMPEG_PATH})
-
 @app.get("/")
 def home():
     return render_template_string(HTML)
 
+# Health endpoint (optional for Railway)
+@app.get("/healthz")
+def health():
+    return "ok"
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Railway provides PORT env automatically
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
